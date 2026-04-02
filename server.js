@@ -25,6 +25,7 @@ const PORT = process.env.PORT || 3001;
 // ─── Allowed origins ─────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://savetaxusa.com",
+  "https://savetaxusa-frontend-avblnnl7n-limausainvestments-projects.vercel.app",
   "https://www.savetaxusa.com",
   "http://localhost:5173",   // Vite dev server
   "http://localhost:3000",
