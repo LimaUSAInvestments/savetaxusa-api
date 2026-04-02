@@ -23,21 +23,24 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 
 // ─── Allowed origins ─────────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = [
-  "https://savetaxusa.com",
-  "https://savetaxusa-frontend-avblnnl7n-limausainvestments-projects.vercel.app",
-  "https://www.savetaxusa.com",
-  "http://localhost:5173",   // Vite dev server
-  "http://localhost:3000",
-];
+// Allow all origins during development — tighten once savetaxusa.com domain is live
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (origin.includes("localhost")) return true;
+  if (origin.includes("savetaxusa.com")) return true;
+  if (origin.includes("vercel.app")) return true;
+  if (origin.includes("onrender.com")) return true;
+  return false;
+}
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(morgan("combined"));
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS blocked: ${origin}`));
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    console.log("CORS blocked: " + origin);
+    cb(null, true); // allow all for now
   },
   credentials: true,
 }));
