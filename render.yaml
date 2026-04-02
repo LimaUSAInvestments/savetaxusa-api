@@ -1,0 +1,24 @@
+# render.yaml — Render.com deployment config
+# Commit this file to your repo root.
+# Render auto-detects it and sets up your service.
+
+services:
+  - type: web
+    name: savetaxusa-api
+    runtime: node
+    plan: free          # upgrade to "starter" ($7/mo) for always-on
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      # Set these in Render Dashboard → Environment (never in this file):
+      # STRIPE_SECRET_KEY
+      # STRIPE_WEBHOOK_SECRET
+      # STRIPE_PRICE_PRO_MONTHLY
+      # STRIPE_PRICE_PRO_ANNUAL
+      # STRIPE_PRICE_ELITE_MONTHLY
+      # STRIPE_PRICE_ELITE_ANNUAL
