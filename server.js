@@ -18,6 +18,45 @@ const stripe    = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const cors      = require("cors");
 const helmet    = require("helmet");
 const morgan    = require("morgan");
+const { createClient } = require("@supabase/supabase-js");
+
+// ─── Supabase admin client (uses service_role key — never expose this!) ───────
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://aonzignujpwjekmnlslg.supabase.co";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+
+const supabase = SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  : null;
+
+async function updateUserPlan(stripeCustomerId, plan, status) {
+  if (!supabase) return;
+  try {
+    await supabase
+      .from("users")
+      .update({ plan, plan_status: status, updated_at: new Date().toISOString() })
+      .eq("stripe_customer_id", stripeCustomerId);
+    console.log(`✅ Plan updated in DB: ${stripeCustomerId} → ${plan} (${status})`);
+  } catch(e) {
+    console.error("Supabase update error:", e.message);
+  }
+}
+
+async function saveStripeCustomerId(email, customerId, subscriptionId) {
+  if (!supabase) return;
+  try {
+    await supabase
+      .from("users")
+      .update({
+        stripe_customer_id: customerId,
+        stripe_subscription_id: subscriptionId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("email", email);
+    console.log(`✅ Stripe IDs saved for ${email}`);
+  } catch(e) {
+    console.error("Supabase saveStripeCustomerId error:", e.message);
+  }
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -118,11 +157,13 @@ app.post("/api/subscribe", async (req, res) => {
 
     const paymentIntent = subscription.latest_invoice?.payment_intent;
 
+    // Save Stripe customer ID to Supabase
+    await saveStripeCustomerId(email, customer.id, subscription.id);
+
     res.json({
       subscriptionId: subscription.id,
       customerId: customer.id,
       status: subscription.status,
-      // clientSecret is only present when payment confirmation is needed (e.g. 3DS)
       clientSecret: paymentIntent?.client_secret || null,
     });
 
@@ -268,14 +309,19 @@ async function handleWebhook(req, res) {
 
       // ── Payment succeeded (initial or renewal) ───────────────────────────
       case "invoice.paid": {
-        const invoice  = event.data.object;
+        const invoice    = event.data.object;
         const customerId = invoice.customer;
-        const subId    = invoice.subscription;
-        const amount   = invoice.amount_paid / 100;
-        const email    = invoice.customer_email;
+        const subId      = invoice.subscription;
+        const amount     = invoice.amount_paid / 100;
+        const email      = invoice.customer_email;
         console.log(`✅ Payment received: $${amount} from ${email} (sub: ${subId})`);
-        // TODO: Update your database — grant full access
-        // await db.users.update({ stripeCustomerId: customerId }, { plan: 'pro', paidThrough: invoice.period_end })
+        // Determine plan from subscription price
+        if (subId) {
+          const sub = await stripe.subscriptions.retrieve(subId);
+          const priceId = sub.items.data[0]?.price?.id || "";
+          const plan = priceId.includes("elite") ? "elite" : "pro";
+          await updateUserPlan(customerId, plan, "active");
+        }
         break;
       }
 
@@ -283,7 +329,9 @@ async function handleWebhook(req, res) {
       case "customer.subscription.created": {
         const sub = event.data.object;
         console.log(`🆕 Subscription created: ${sub.id} status=${sub.status}`);
-        // TODO: Create user account or update plan in your DB
+        const priceId = sub.items.data[0]?.price?.id || "";
+        const plan = priceId.includes("elite") ? "elite" : "pro";
+        await updateUserPlan(sub.customer, plan, sub.status);
         break;
       }
 
@@ -307,8 +355,7 @@ async function handleWebhook(req, res) {
       case "customer.subscription.deleted": {
         const sub = event.data.object;
         console.log(`❌ Subscription cancelled: ${sub.id}`);
-        // TODO: Downgrade user to free plan in your DB
-        // await db.users.update({ stripeCustomerId: sub.customer }, { plan: 'free' })
+        await updateUserPlan(sub.customer, "free", "cancelled");
         break;
       }
 
