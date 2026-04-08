@@ -18,6 +18,7 @@ const stripe    = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const cors      = require("cors");
 const helmet    = require("helmet");
 const morgan    = require("morgan");
+const crypto    = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
 // ─── Supabase admin client (uses service_role key — never expose this!) ───────
@@ -611,6 +612,491 @@ setTimeout(async () => {
   console.log("🚀 Initial reminder check on startup...");
   await sendQuarterlyReminders();
 }, 10000);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ELITE-TIER MIDDLEWARE & ENDPOINTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── Require Elite Plan Middleware ───────────────────────────────────────────
+async function requireElite(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "Authorization required" });
+  // Verify with Supabase - extract user from JWT
+  if (!supabase) return res.status(500).json({ error: "Database not configured" });
+  const token = authHeader.replace("Bearer ", "");
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: "Invalid token" });
+  // Check plan
+  const { data: profile } = await supabase.from("users").select("plan,plan_status").eq("id", user.id).single();
+  if (!profile || profile.plan !== "elite" || !["active","trialing"].includes(profile.plan_status)) {
+    return res.status(403).json({ error: "Elite plan required" });
+  }
+  req.user = user;
+  req.userProfile = profile;
+  next();
+}
+
+// ─── Federal Tax Bracket Calculator ─────────────────────────────────────────
+const FEDERAL_BRACKETS = [
+  { min:0, max:11600, rate:0.10 },
+  { min:11600, max:47150, rate:0.12 },
+  { min:47150, max:100525, rate:0.22 },
+  { min:100525, max:191950, rate:0.24 },
+  { min:191950, max:243725, rate:0.32 },
+  { min:243725, max:609350, rate:0.35 },
+  { min:609350, max:Infinity, rate:0.37 },
+];
+
+function calcFederalTax(income) {
+  let tax = 0;
+  for (const b of FEDERAL_BRACKETS) {
+    if (income <= 0) break;
+    const t = Math.min(income, b.max - b.min);
+    tax += t * b.rate;
+    income -= t;
+  }
+  return tax;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TEAM MANAGEMENT ENDPOINTS (Elite only)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// POST /api/team — Create team
+app.post("/api/team", requireElite, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "Team name is required" });
+
+    // Check user doesn't already own a team
+    const { data: existingTeam } = await supabase
+      .from("teams")
+      .select("id")
+      .eq("owner_id", req.user.id)
+      .single();
+
+    if (existingTeam) {
+      return res.status(409).json({ error: "You already own a team" });
+    }
+
+    // Insert into teams table
+    const { data: team, error: teamError } = await supabase
+      .from("teams")
+      .insert({ name, owner_id: req.user.id })
+      .select()
+      .single();
+
+    if (teamError) {
+      console.error("Create team error:", teamError);
+      return res.status(500).json({ error: "Failed to create team" });
+    }
+
+    // Add owner as first team_member
+    const { error: memberError } = await supabase
+      .from("team_members")
+      .insert({
+        team_id: team.id,
+        user_id: req.user.id,
+        email: req.user.email,
+        role: "owner",
+        status: "active",
+      });
+
+    if (memberError) {
+      console.error("Add owner member error:", memberError);
+      return res.status(500).json({ error: "Failed to add owner as team member" });
+    }
+
+    res.json({ team });
+  } catch (err) {
+    console.error("POST /api/team error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/team — Get user's team
+app.get("/api/team", requireElite, async (req, res) => {
+  try {
+    const { data: team, error: teamError } = await supabase
+      .from("teams")
+      .select("*")
+      .eq("owner_id", req.user.id)
+      .single();
+
+    if (teamError || !team) {
+      return res.json({ team: null, members: [] });
+    }
+
+    const { data: members, error: membersError } = await supabase
+      .from("team_members")
+      .select("*")
+      .eq("team_id", team.id);
+
+    if (membersError) {
+      console.error("Fetch team members error:", membersError);
+      return res.status(500).json({ error: "Failed to fetch team members" });
+    }
+
+    res.json({ team, members: members || [] });
+  } catch (err) {
+    console.error("GET /api/team error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/team/invite — Invite member
+app.post("/api/team/invite", requireElite, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Email is required" });
+
+    // Verify team exists and user is owner
+    const { data: team } = await supabase
+      .from("teams")
+      .select("id, max_seats")
+      .eq("owner_id", req.user.id)
+      .single();
+
+    if (!team) {
+      return res.status(404).json({ error: "You don't own a team. Create one first." });
+    }
+
+    // Check seat count
+    const { data: currentMembers } = await supabase
+      .from("team_members")
+      .select("id")
+      .eq("team_id", team.id)
+      .in("status", ["active", "pending"]);
+
+    if (currentMembers && currentMembers.length >= (team.max_seats || 5)) {
+      return res.status(400).json({ error: "Team has reached maximum seat count" });
+    }
+
+    // Check email not already invited
+    const { data: existingMember } = await supabase
+      .from("team_members")
+      .select("id, status")
+      .eq("team_id", team.id)
+      .eq("email", email)
+      .in("status", ["active", "pending"])
+      .single();
+
+    if (existingMember) {
+      return res.status(409).json({ error: "This email has already been invited" });
+    }
+
+    // Insert team_member with status='pending'
+    const { data: member, error: insertError } = await supabase
+      .from("team_members")
+      .insert({
+        team_id: team.id,
+        email,
+        role: "member",
+        status: "pending",
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error("Invite member error:", insertError);
+      return res.status(500).json({ error: "Failed to invite member" });
+    }
+
+    res.json({ member });
+  } catch (err) {
+    console.error("POST /api/team/invite error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// DELETE /api/team/member/:memberId — Remove member
+app.delete("/api/team/member/:memberId", requireElite, async (req, res) => {
+  try {
+    const { memberId } = req.params;
+
+    // Verify user owns the team
+    const { data: team } = await supabase
+      .from("teams")
+      .select("id")
+      .eq("owner_id", req.user.id)
+      .single();
+
+    if (!team) {
+      return res.status(404).json({ error: "You don't own a team" });
+    }
+
+    // Get the member
+    const { data: member } = await supabase
+      .from("team_members")
+      .select("id, role, team_id")
+      .eq("id", memberId)
+      .eq("team_id", team.id)
+      .single();
+
+    if (!member) {
+      return res.status(404).json({ error: "Member not found" });
+    }
+
+    // Can't remove the owner
+    if (member.role === "owner") {
+      return res.status(400).json({ error: "Cannot remove the team owner" });
+    }
+
+    // Update status to 'removed'
+    const { error: updateError } = await supabase
+      .from("team_members")
+      .update({ status: "removed" })
+      .eq("id", memberId);
+
+    if (updateError) {
+      console.error("Remove member error:", updateError);
+      return res.status(500).json({ error: "Failed to remove member" });
+    }
+
+    res.json({ success: true, message: "Member removed" });
+  } catch (err) {
+    console.error("DELETE /api/team/member error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// API KEY MANAGEMENT (Elite only)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// POST /api/keys — Generate new API key
+app.post("/api/keys", requireElite, async (req, res) => {
+  try {
+    const { name = "Default" } = req.body;
+
+    // Generate a random key: "stx_" + 32 random hex chars
+    const rawKey = "stx_" + crypto.randomBytes(16).toString("hex");
+    const keyHash = crypto.createHash("sha256").update(rawKey).digest("hex");
+    const keyPrefix = rawKey.substring(0, 12); // e.g. "stx_abcd1234"
+
+    const { data: apiKey, error } = await supabase
+      .from("api_keys")
+      .insert({
+        user_id: req.user.id,
+        key_hash: keyHash,
+        key_prefix: keyPrefix,
+        name,
+        is_active: true,
+      })
+      .select("id, key_prefix, name, is_active, created_at")
+      .single();
+
+    if (error) {
+      console.error("Create API key error:", error);
+      return res.status(500).json({ error: "Failed to create API key" });
+    }
+
+    // Return the FULL key (only time it's shown)
+    res.json({ ...apiKey, key: rawKey });
+  } catch (err) {
+    console.error("POST /api/keys error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/keys — List user's API keys
+app.get("/api/keys", requireElite, async (req, res) => {
+  try {
+    const { data: keys, error } = await supabase
+      .from("api_keys")
+      .select("id, key_prefix, name, is_active, last_used_at, created_at")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("List API keys error:", error);
+      return res.status(500).json({ error: "Failed to list API keys" });
+    }
+
+    res.json({ keys: keys || [] });
+  } catch (err) {
+    console.error("GET /api/keys error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// DELETE /api/keys/:keyId — Revoke API key
+app.delete("/api/keys/:keyId", requireElite, async (req, res) => {
+  try {
+    const { keyId } = req.params;
+
+    const { error } = await supabase
+      .from("api_keys")
+      .update({ is_active: false })
+      .eq("id", keyId)
+      .eq("user_id", req.user.id);
+
+    if (error) {
+      console.error("Revoke API key error:", error);
+      return res.status(500).json({ error: "Failed to revoke API key" });
+    }
+
+    res.json({ success: true, message: "API key revoked" });
+  } catch (err) {
+    console.error("DELETE /api/keys error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PUBLIC API — TAX CALCULATION (Authenticated via API Key)
+// POST /api/v1/calculate
+// ═════════════════════════════════════════════════════════════════════════════
+app.post("/api/v1/calculate", async (req, res) => {
+  try {
+    const apiKey = req.headers["x-api-key"];
+    if (!apiKey) {
+      return res.status(401).json({ error: "API key required. Pass x-api-key header." });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({ error: "Database not configured" });
+    }
+
+    // Validate the API key: hash it, look up in api_keys table
+    const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+
+    const { data: keyRecord, error: keyError } = await supabase
+      .from("api_keys")
+      .select("id, user_id, is_active")
+      .eq("key_hash", keyHash)
+      .eq("is_active", true)
+      .single();
+
+    if (keyError || !keyRecord) {
+      return res.status(401).json({ error: "Invalid or revoked API key" });
+    }
+
+    // Update last_used_at
+    await supabase
+      .from("api_keys")
+      .update({ last_used_at: new Date().toISOString() })
+      .eq("id", keyRecord.id);
+
+    // Check the key owner has elite plan
+    const { data: owner } = await supabase
+      .from("users")
+      .select("plan, plan_status")
+      .eq("id", keyRecord.user_id)
+      .single();
+
+    if (!owner || owner.plan !== "elite" || !["active","trialing"].includes(owner.plan_status)) {
+      return res.status(403).json({ error: "API key owner must have an active Elite plan" });
+    }
+
+    // Validate request body
+    const { income, filingStatus, state, deductions } = req.body;
+    if (income === undefined || income === null) {
+      return res.status(400).json({ error: "income is required" });
+    }
+
+    const grossIncome = Number(income);
+    if (isNaN(grossIncome) || grossIncome < 0) {
+      return res.status(400).json({ error: "income must be a non-negative number" });
+    }
+
+    const totalDeductions = Number(deductions) || 0;
+
+    // Self-employment tax (15.3% on 92.35% of income)
+    const seBase = grossIncome * 0.9235;
+    const seTax = seBase * 0.153;
+
+    // Taxable income after deductions and half of SE tax
+    const taxableIncome = Math.max(0, grossIncome - totalDeductions - (seTax / 2));
+
+    // Federal tax
+    const federalTax = calcFederalTax(taxableIncome);
+
+    // State tax (simple flat estimate — 5% default, can be expanded later)
+    const STATE_RATES = {
+      "CA": 0.0930, "NY": 0.0685, "TX": 0, "FL": 0, "WA": 0, "NV": 0,
+      "IL": 0.0495, "PA": 0.0307, "OH": 0.04, "NJ": 0.0637, "GA": 0.055,
+      "NC": 0.0525, "MA": 0.05, "VA": 0.0575, "CO": 0.044, "AZ": 0.025,
+      "TN": 0, "WY": 0, "SD": 0, "AK": 0, "NH": 0,
+    };
+    const stateCode = (state || "").toUpperCase();
+    const stateRate = STATE_RATES[stateCode] !== undefined ? STATE_RATES[stateCode] : 0.05;
+    const stateTax = taxableIncome * stateRate;
+
+    const totalTax = seTax + federalTax + stateTax;
+    const netIncome = grossIncome - totalTax;
+    const effectiveRate = grossIncome > 0 ? totalTax / grossIncome : 0;
+    const quarterlyPayment = totalTax / 4;
+
+    res.json({
+      gross: Math.round(grossIncome * 100) / 100,
+      netIncome: Math.round(netIncome * 100) / 100,
+      seTax: Math.round(seTax * 100) / 100,
+      federalTax: Math.round(federalTax * 100) / 100,
+      stateTax: Math.round(stateTax * 100) / 100,
+      totalTax: Math.round(totalTax * 100) / 100,
+      effectiveRate: Math.round(effectiveRate * 10000) / 10000,
+      quarterlyPayment: Math.round(quarterlyPayment * 100) / 100,
+    });
+  } catch (err) {
+    console.error("POST /api/v1/calculate error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WHITE-LABEL BRANDING SETTINGS (Elite only)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// PUT /api/branding — Update company branding
+app.put("/api/branding", requireElite, async (req, res) => {
+  try {
+    const { companyName, companyLogoUrl, brandColor } = req.body;
+
+    const { data, error } = await supabase
+      .from("users")
+      .update({
+        company_name: companyName || null,
+        company_logo_url: companyLogoUrl || null,
+        brand_color: brandColor || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.user.id)
+      .select("company_name, company_logo_url, brand_color")
+      .single();
+
+    if (error) {
+      console.error("Update branding error:", error);
+      return res.status(500).json({ error: "Failed to update branding" });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error("PUT /api/branding error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/branding — Get branding settings
+app.get("/api/branding", requireElite, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .select("company_name, company_logo_url, brand_color")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) {
+      console.error("Get branding error:", error);
+      return res.status(500).json({ error: "Failed to fetch branding" });
+    }
+
+    res.json(data || { company_name: null, company_logo_url: null, brand_color: null });
+  } catch (err) {
+    console.error("GET /api/branding error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GLOBAL ERROR HANDLER
