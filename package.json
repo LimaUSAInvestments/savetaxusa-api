@@ -12,6 +12,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.102.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
@@ -22,7 +23,13 @@
   "devDependencies": {
     "nodemon": "^3.1.4"
   },
-  "keywords": ["stripe", "subscriptions", "savetaxusa", "real-estate", "tax"],
+  "keywords": [
+    "stripe",
+    "subscriptions",
+    "savetaxusa",
+    "real-estate",
+    "tax"
+  ],
   "author": "SaveTaxUSA",
   "license": "UNLICENSED"
 }
