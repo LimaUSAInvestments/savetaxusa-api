@@ -28,6 +28,168 @@ const supabase = SUPABASE_SERVICE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
   : null;
 
+// ─── Resend Email Client ─────────────────────────────────────────────────────
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const FROM_EMAIL     = process.env.FROM_EMAIL || "reminders@savetaxusa.com";
+
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) { console.log("⚠️ No Resend key — email skipped"); return; }
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ from: FROM_EMAIL, to, subject, html }),
+    });
+    const data = await res.json();
+    if (res.ok) console.log(`✅ Email sent to ${to}: ${data.id}`);
+    else console.error(`❌ Email failed to ${to}:`, data);
+    return data;
+  } catch(e) {
+    console.error("Email send error:", e.message);
+  }
+}
+
+// ─── IRS Quarterly Dates ──────────────────────────────────────────────────────
+const QUARTERLY_DATES = [
+  { q:"Q1", due:"April 15",    month:3,  day:15 },
+  { q:"Q2", due:"June 16",     month:5,  day:16 },
+  { q:"Q3", due:"September 15",month:8,  day:15 },
+  { q:"Q4", due:"January 15",  month:0,  day:15 },
+];
+
+function daysUntil(month, day) {
+  const now  = new Date();
+  const year = now.getFullYear();
+  let target = new Date(year, month, day);
+  if (target < now) target = new Date(year + 1, month, day);
+  return Math.ceil((target - now) / (1000 * 60 * 60 * 24));
+}
+
+function getUpcomingQuarter() {
+  return QUARTERLY_DATES.find(q => {
+    const d = daysUntil(q.month, q.day);
+    return d >= 0 && d <= 7; // within 7 days
+  });
+}
+
+// ─── Beautiful HTML Email Template ───────────────────────────────────────────
+function buildReminderEmail({ name, email, quarter, dueDate, daysLeft }) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  const urgency   = daysLeft <= 2 ? "🚨 URGENT" : daysLeft <= 5 ? "⚠️ Coming Up" : "📅 Reminder";
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>IRS Payment Due — SaveTaxUSA</title></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div style="max-width:560px;margin:0 auto;padding:24px 16px;">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#1e4d8c 0%,#2d5fa8 100%);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center;">
+      <div style="font-size:22px;font-weight:800;letter-spacing:0.5px;margin-bottom:4px;">
+        <span style="color:#ef4444;">SAVE</span><span style="color:#fff;">TAX</span><span style="color:#ef4444;">USA</span>
+      </div>
+      <div style="color:rgba(255,255,255,0.75);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;">Real Estate Tax Intelligence</div>
+    </div>
+
+    <!-- Body -->
+    <div style="background:#fff;padding:32px;border:1px solid #e2e8f0;border-top:none;">
+      <div style="display:inline-block;background:#fef3c7;color:#92400e;font-size:12px;font-weight:700;padding:4px 14px;border-radius:20px;margin-bottom:20px;">${urgency}</div>
+
+      <h1 style="font-size:22px;font-weight:800;color:#0f172a;margin:0 0 8px;">Hi ${firstName},</h1>
+      <p style="color:#64748b;font-size:15px;line-height:1.7;margin:0 0 24px;">
+        Your <strong style="color:#1e293b;">${quarter} estimated tax payment</strong> is due in 
+        <strong style="color:#9b1c1c;">${daysLeft} day${daysLeft===1?"":"s"}</strong> on <strong style="color:#1e293b;">${dueDate}</strong>.
+      </p>
+
+      <!-- Due Date Card -->
+      <div style="background:#fff0f0;border:1.5px solid #fecaca;border-radius:12px;padding:20px;margin-bottom:24px;text-align:center;">
+        <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Payment Due Date</div>
+        <div style="font-size:28px;font-weight:800;color:#9b1c1c;">${dueDate}</div>
+        <div style="font-size:13px;color:#64748b;margin-top:4px;">${daysLeft} day${daysLeft===1?"":"s"} remaining</div>
+      </div>
+
+      <!-- Action Button -->
+      <div style="text-align:center;margin-bottom:24px;">
+        <a href="https://savetaxusa.com/app/quarterly" 
+           style="display:inline-block;background:#1e4d8c;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:10px;">
+          Calculate My Payment →
+        </a>
+      </div>
+
+      <!-- Steps -->
+      <div style="background:#f8fafc;border-radius:10px;padding:16px 20px;margin-bottom:24px;">
+        <div style="font-size:13px;font-weight:700;color:#1e293b;margin-bottom:12px;">How to pay in 3 steps:</div>
+        ${["Go to IRS Direct Pay at <strong>irs.gov/payments</strong>","Select 'Estimated Tax' as payment type","Pay your estimated amount before midnight on " + dueDate].map((s,i)=>`
+        <div style="display:flex;gap:10px;margin-bottom:8px;align-items:flex-start;">
+          <div style="min-width:22px;height:22px;border-radius:50%;background:#1e4d8c;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;">${i+1}</div>
+          <div style="font-size:13px;color:#475569;line-height:1.5;">${s}</div>
+        </div>`).join("")}
+      </div>
+
+      <p style="font-size:12px;color:#94a3b8;line-height:1.6;margin:0;">
+        Missing this deadline may result in IRS underpayment penalties. 
+        Log into SaveTaxUSA to check your quarterly estimates and set-aside amounts.
+      </p>
+    </div>
+
+    <!-- Footer -->
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 16px 16px;padding:16px 32px;text-align:center;">
+      <p style="font-size:11px;color:#94a3b8;margin:0 0 6px;">
+        You're receiving this because you have an active SaveTaxUSA account.
+      </p>
+      <p style="font-size:11px;color:#94a3b8;margin:0;">
+        <a href="https://savetaxusa.com" style="color:#1e4d8c;">savetaxusa.com</a> · 
+        This is not official tax advice. Consult a licensed CPA for your specific situation.
+      </p>
+    </div>
+
+  </div>
+</body></html>`;
+}
+
+// ─── Send reminder to all Pro/Elite users ────────────────────────────────────
+async function sendQuarterlyReminders() {
+  if (!supabase) { console.log("⚠️ No Supabase — skipping reminders"); return; }
+  const quarter = getUpcomingQuarter();
+  if (!quarter) { console.log("📅 No quarterly deadline in next 7 days"); return; }
+
+  const daysLeft = daysUntil(quarter.month, quarter.day);
+  console.log(`📧 Sending ${quarter.q} reminders (due in ${daysLeft} days)...`);
+
+  // Get all Pro/Elite users
+  const { data: users, error } = await supabase
+    .from("users")
+    .select("id, email, name, plan, plan_status")
+    .in("plan", ["pro", "elite"])
+    .in("plan_status", ["active", "trialing"]);
+
+  if (error) { console.error("Failed to fetch users:", error); return; }
+  if (!users?.length) { console.log("No Pro/Elite users found"); return; }
+
+  console.log(`Found ${users.length} users to remind`);
+  let sent = 0;
+  for (const user of users) {
+    if (!user.email) continue;
+    await sendEmail({
+      to: user.email,
+      subject: `⏰ ${quarter.q} IRS Payment Due in ${daysLeft} Day${daysLeft===1?"":"s"} — ${quarter.due}`,
+      html: buildReminderEmail({
+        name: user.name || "",
+        email: user.email,
+        quarter: quarter.q,
+        dueDate: quarter.due,
+        daysLeft,
+      }),
+    });
+    sent++;
+    // Small delay to avoid rate limits
+    await new Promise(r => setTimeout(r, 100));
+  }
+  console.log(`✅ Sent ${sent} reminder emails for ${quarter.q}`);
+}
+
 async function updateUserPlan(stripeCustomerId, plan, status) {
   if (!supabase) return;
   try {
@@ -397,6 +559,60 @@ async function handleWebhook(req, res) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// QUARTERLY REMINDER ENDPOINT + CRON
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Manual trigger endpoint (also used by external cron services)
+app.post("/api/send-reminders", async (req, res) => {
+  const secret = req.headers["x-cron-secret"];
+  if (secret !== process.env.CRON_SECRET && process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    await sendQuarterlyReminders();
+    res.json({ success: true, message: "Reminders processed" });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Test endpoint — send a test email to a specific address
+app.post("/api/test-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  try {
+    await sendEmail({
+      to: email,
+      subject: "✅ SaveTaxUSA Email Test",
+      html: buildReminderEmail({
+        name: "Fernando",
+        email,
+        quarter: "Q2",
+        dueDate: "June 16",
+        daysLeft: 5,
+      }),
+    });
+    res.json({ success: true, message: `Test email sent to ${email}` });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Built-in daily check — runs every 24 hours
+// For production, also set up an external cron at cron-job.org hitting /api/send-reminders
+const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+setInterval(async () => {
+  console.log("⏰ Daily reminder check running...");
+  await sendQuarterlyReminders();
+}, TWENTY_FOUR_HOURS);
+
+// Also run once on startup (after 10 seconds to let server warm up)
+setTimeout(async () => {
+  console.log("🚀 Initial reminder check on startup...");
+  await sendQuarterlyReminders();
+}, 10000);
+
+// ═════════════════════════════════════════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ═════════════════════════════════════════════════════════════════════════════
 app.use((err, req, res, next) => {
@@ -409,5 +625,7 @@ app.listen(PORT, () => {
   console.log(`\n🦅 SaveTaxUSA API running on port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/health`);
   console.log(`   Stripe key set: ${!!process.env.STRIPE_SECRET_KEY}`);
-  console.log(`   Webhook secret set: ${!!process.env.STRIPE_WEBHOOK_SECRET}\n`);
+  console.log(`   Webhook secret set: ${!!process.env.STRIPE_WEBHOOK_SECRET}`);
+  console.log(`   Resend email set: ${!!process.env.RESEND_API_KEY}`);
+  console.log(`   Supabase set: ${!!process.env.SUPABASE_SERVICE_KEY}\n`);
 });
