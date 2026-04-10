@@ -69,11 +69,15 @@ function daysUntil(month, day) {
   return Math.ceil((target - now) / (1000 * 60 * 60 * 24));
 }
 
-function getUpcomingQuarter() {
-  return QUARTERLY_DATES.find(q => {
+const REMINDER_DAYS = [7, 1]; // Send exactly 7 days and 1 day before deadline
+
+function getQuartersDueForReminder() {
+  const results = [];
+  for (const q of QUARTERLY_DATES) {
     const d = daysUntil(q.month, q.day);
-    return d >= 0 && d <= 7; // within 7 days
-  });
+    if (REMINDER_DAYS.includes(d)) results.push({ ...q, daysLeft: d });
+  }
+  return results;
 }
 
 // ─── Beautiful HTML Email Template ───────────────────────────────────────────
@@ -150,45 +154,82 @@ function buildReminderEmail({ name, email, quarter, dueDate, daysLeft }) {
 </body></html>`;
 }
 
+// ─── Dedup key: "Q2-2026-7" means Q2 2026 reminder for 7-days-before ────────
+// Stored in-memory + checked against Supabase to survive restarts.
+const sentReminders = new Set();
+
+async function wasReminderAlreadySent(reminderKey) {
+  // Check memory first (fast path for same-process re-runs)
+  if (sentReminders.has(reminderKey)) return true;
+  // Check Supabase reminder_log table (survives restarts)
+  if (!supabase) return false;
+  const { data } = await supabase
+    .from("reminder_log")
+    .select("id")
+    .eq("reminder_key", reminderKey)
+    .limit(1);
+  if (data?.length) { sentReminders.add(reminderKey); return true; }
+  return false;
+}
+
+async function markReminderSent(reminderKey) {
+  sentReminders.add(reminderKey);
+  if (!supabase) return;
+  await supabase.from("reminder_log").insert({ reminder_key: reminderKey, sent_at: new Date().toISOString() }).select();
+}
+
 // ─── Send reminder to all Pro/Elite users ────────────────────────────────────
 async function sendQuarterlyReminders() {
   if (!supabase) { console.log("⚠️ No Supabase — skipping reminders"); return; }
-  const quarter = getUpcomingQuarter();
-  if (!quarter) { console.log("📅 No quarterly deadline in next 7 days"); return; }
+  const quarters = getQuartersDueForReminder();
+  if (!quarters.length) { console.log("📅 No reminders due today (only sent 7 days and 1 day before)"); return; }
 
-  const daysLeft = daysUntil(quarter.month, quarter.day);
-  console.log(`📧 Sending ${quarter.q} reminders (due in ${daysLeft} days)...`);
+  for (const quarter of quarters) {
+    const { daysLeft } = quarter;
+    const today = new Date();
+    const reminderKey = `${quarter.q}-${today.getFullYear()}-${daysLeft}d`;
 
-  // Get all Pro/Elite users
-  const { data: users, error } = await supabase
-    .from("users")
-    .select("id, email, name, plan, plan_status")
-    .in("plan", ["pro", "elite"])
-    .in("plan_status", ["active", "trialing"]);
+    // Skip if already sent today
+    if (await wasReminderAlreadySent(reminderKey)) {
+      console.log(`⏭ Reminder "${reminderKey}" already sent — skipping`);
+      continue;
+    }
 
-  if (error) { console.error("Failed to fetch users:", error); return; }
-  if (!users?.length) { console.log("No Pro/Elite users found"); return; }
+    console.log(`📧 Sending ${quarter.q} reminders (due in ${daysLeft} days)...`);
 
-  console.log(`Found ${users.length} users to remind`);
-  let sent = 0;
-  for (const user of users) {
-    if (!user.email) continue;
-    await sendEmail({
-      to: user.email,
-      subject: `⏰ ${quarter.q} IRS Payment Due in ${daysLeft} Day${daysLeft===1?"":"s"} — ${quarter.due}`,
-      html: buildReminderEmail({
-        name: user.name || "",
-        email: user.email,
-        quarter: quarter.q,
-        dueDate: quarter.due,
-        daysLeft,
-      }),
-    });
-    sent++;
-    // Small delay to avoid rate limits
-    await new Promise(r => setTimeout(r, 100));
+    // Get all Pro/Elite users
+    const { data: users, error } = await supabase
+      .from("users")
+      .select("id, email, name, plan, plan_status")
+      .in("plan", ["pro", "elite"])
+      .in("plan_status", ["active", "trialing"]);
+
+    if (error) { console.error("Failed to fetch users:", error); return; }
+    if (!users?.length) { console.log("No Pro/Elite users found"); continue; }
+
+    console.log(`Found ${users.length} users to remind`);
+    let sent = 0;
+    for (const user of users) {
+      if (!user.email) continue;
+      await sendEmail({
+        to: user.email,
+        subject: `⏰ ${quarter.q} IRS Payment Due in ${daysLeft} Day${daysLeft===1?"":"s"} — ${quarter.due}`,
+        html: buildReminderEmail({
+          name: user.name || "",
+          email: user.email,
+          quarter: quarter.q,
+          dueDate: quarter.due,
+          daysLeft,
+        }),
+      });
+      sent++;
+      // Small delay to avoid rate limits
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    await markReminderSent(reminderKey);
+    console.log(`✅ Sent ${sent} reminder emails for ${quarter.q} (${daysLeft} days before) — logged as "${reminderKey}"`);
   }
-  console.log(`✅ Sent ${sent} reminder emails for ${quarter.q}`);
 }
 
 async function updateUserPlan(stripeCustomerId, plan, status) {
@@ -607,11 +648,11 @@ setInterval(async () => {
   await sendQuarterlyReminders();
 }, TWENTY_FOUR_HOURS);
 
-// Also run once on startup (after 10 seconds to let server warm up)
+// Run once on startup (after 30 seconds) — dedup guard prevents duplicate emails
 setTimeout(async () => {
-  console.log("🚀 Initial reminder check on startup...");
+  console.log("🚀 Startup reminder check (dedup-protected)...");
   await sendQuarterlyReminders();
-}, 10000);
+}, 30000);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ELITE-TIER MIDDLEWARE & ENDPOINTS
